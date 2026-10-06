@@ -63,8 +63,14 @@ curl -s http://localhost:8080/api/dicom/frames \
   边界全部核对，无尾随数据，仅有一个 Pixel Data；
 - Pixel Data 为未定义长度的 OB 封装流，项目长度合规（偶数且 ≥ 2），
   以长度为 0 的 Sequence Delimitation Item（`FFFE,E0DD`）结束；
-- **完整 Basic Offset Table**：首项为 0、严格递增、条目数等于声明帧数、
-  每项都落在片段项目边界上；空 BOT、越界 BOT、BOT 与片段间填充一律拒绝；
+- 帧边界二选一声明：
+  - **完整 Basic Offset Table**：首项为 0、严格递增、条目数等于声明帧数、
+    每项都落在片段项目边界上；空 BOT、越界 BOT、BOT 与片段间填充一律拒绝；
+  - **空 Basic Offset Table + 扩展偏移表**（超大切片）：Extended Offset Table
+    `(7FE0,0001)` 与 Extended Offset Table Lengths `(7FE0,0002)` 必须**成对**
+    出现在 Pixel Data 之前、使用显式 VR 小端 `OV`，且不得与非空 BOT 混用；
+    两表条目数均等于声明帧数，偏移首项为 0、严格递增并落在片段项目边界上，
+    每个长度必须等于对应帧覆盖的全部片段载荷字节数；
 - 每帧拼接后必须是结构合法的 Baseline JPEG：SOI/EOI、唯一 `SOF0`、
   合法标记段与 SOS 扫描（熵数据中的 `FF00` 填充与 `RSTn` 正确识别）。
   按 PS3.5 6.2/A.4，每帧最后一个片段允许在 EOI 后恰好一个 `0x00` 偶对齐填充，
@@ -89,7 +95,8 @@ curl -s http://localhost:8080/api/dicom/frames \
 | 422 | `TRUNCATED_DATA` | 任何头部、值、项目或结束标记被截断 |
 | 422 | `INVALID_FRAME_DECLARATION` | Number of Frames 缺失/非法/超出 1..256/与 BOT 不符 |
 | 422 | `PIXEL_DATA_STRUCTURE` | Pixel Data 封装结构、项目或结束标记错误 |
-| 422 | `INVALID_BASIC_OFFSET_TABLE` | BOT 为空/首项非 0/非递增/不对齐/数量不符 |
+| 422 | `INVALID_BASIC_OFFSET_TABLE` | BOT 为空（且无扩展表）/首项非 0/非递增/不对齐/数量不符 |
+| 422 | `INVALID_EXTENDED_OFFSET_TABLE` | 扩展表未成对/VR 非 OV/与非空 BOT 混用/数量不符/偏移越界/长度矛盾 |
 | 422 | `INVALID_JPEG_STREAM` | 帧不是合法 Baseline JPEG |
 | 422 | `UNEXPECTED_TRAILING_DATA` | Pixel Data 之后存在尾随字节 |
 
@@ -110,7 +117,8 @@ APP_PORT=8080 .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080
 APP_PORT=8080 docker compose up --build api
 
 # 一次性校验：等待 API 健康 -> pytest 代码测试 -> 应用构建检查
-#   -> 合法文件（含多片段帧）与坏偏移表的接口冒烟，以退出码报告后退出
+#   -> 合法文件（含多片段帧与扩展偏移表文件）与坏偏移表/长度矛盾的
+#   接口冒烟，以退出码报告后退出
 APP_PORT=8080 docker compose up --build \
   --abort-on-container-exit --exit-code-from verify
 echo "verify exit code: $?"
@@ -123,4 +131,4 @@ echo "verify exit code: $?"
 ```
 
 测试包含与 `pydicom` 生成的真实 Part 10 文件的逐字节交叉验证
-（BOT 语义、多片段分组、奇数帧偶对齐填充）。
+（BOT 语义、扩展偏移表、多片段分组、奇数帧偶对齐填充）。

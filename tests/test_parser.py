@@ -6,6 +6,7 @@ import base64
 
 from app.errors import (
     INVALID_BASIC_OFFSET_TABLE,
+    INVALID_EXTENDED_OFFSET_TABLE,
     INVALID_FRAME_DECLARATION,
     INVALID_JPEG_STREAM,
     INVALID_METADATA,
@@ -280,6 +281,142 @@ def test_bot_points_past_actual_item():
     # second offset declares a boundary that doesn't exist
     with raises_dicom_error(INVALID_BASIC_OFFSET_TABLE):
         parse_dicom(build_dicom(frames, bot_entries=[0, 999999]))
+
+
+# --------------------------------------------------------------------------- #
+# Extended Offset Table (7FE0,0001) / Lengths (7FE0,0002) with an empty BOT
+# --------------------------------------------------------------------------- #
+
+def _extended(frames, **kwargs):
+    """Build a file whose frame boundaries come from the extended tables."""
+    kwargs.setdefault("extended", True)
+    kwargs.setdefault("bot_entries", [])  # empty Basic Offset Table
+    return build_dicom(frames, **kwargs)
+
+
+def test_extended_single_frame():
+    f = jpeg_stream(seed=41)
+    parsed = parse_dicom(_extended([f]))
+    assert parsed.number_of_frames == 1
+    assert parsed.frames[0].data == f
+    assert parsed.frames[0].fragment_count == 1
+
+
+def test_extended_multiframe_with_multifragment_frame():
+    frames = _frames(4, multi=(1, 3))
+    parsed = parse_dicom(_extended(frames))
+    assert parsed.number_of_frames == 4
+    for i, expected_fragments in enumerate(frames):
+        frags = [expected_fragments] if isinstance(expected_fragments, (bytes, bytearray)) else expected_fragments
+        joined = b"".join(frags)
+        assert parsed.frames[i].data == joined
+        assert parsed.frames[i].fragment_count == len(frags)
+        assert parsed.frames[i].byte_count == len(joined)
+
+
+def test_extended_extraction_is_byte_stable():
+    frames = _frames(3, multi=(2,))
+    blob = _extended(frames)
+    a = parse_dicom(blob)
+    b = parse_dicom(blob)
+    for fa, fb in zip(a.frames, b.frames):
+        assert fa.data == fb.data
+        assert fa.fragment_count == fb.fragment_count
+
+
+def test_extended_odd_length_frame_padding_verbatim():
+    odd = jpeg_stream(seed=42, pad_to_even=False, force_odd=True)
+    assert len(odd) % 2 == 1
+    f = odd + b"\x00"
+    parsed = parse_dicom(_extended([f]))
+    assert parsed.frames[0].data == f
+
+
+def test_extended_missing_lengths_table_rejected():
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(_frames(2), include_eotl=False))
+
+
+def test_extended_missing_offsets_table_rejected():
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(_frames(2), include_eot=False))
+
+
+def test_extended_mixed_with_nonempty_bot_rejected():
+    # Non-empty Basic Offset Table (natural entries) plus the extended pair.
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(build_dicom(_frames(2), extended=True))
+
+
+def test_extended_offset_count_mismatch_rejected():
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(_frames(2), eot_entries=[0]))
+
+
+def test_extended_lengths_count_mismatch_rejected():
+    frames = _frames(2)
+    natural = [len(f) for f in frames]
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(frames, eotl_entries=natural + [8]))
+
+
+def test_extended_first_offset_not_zero():
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(_frames(2), eot_entries=[8, 160]))
+
+
+def test_extended_offsets_not_strictly_increasing():
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(_frames(2), eot_entries=[0, 0]))
+
+
+def test_extended_offset_off_fragment_boundary():
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(_frames(2), eot_entries=[0, 2]))
+
+
+def test_extended_offset_out_of_range():
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(_frames(2), eot_entries=[0, 999999]))
+
+
+def test_extended_offset_beyond_32_bits_accepted_semantics():
+    # 64-bit entries are parsed as such; a huge offset simply misses every
+    # fragment boundary and is rejected as out of range (not truncated).
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(_frames(2), eot_entries=[0, 2**33]))
+
+
+def test_extended_length_contradicts_fragment_extent():
+    frames = _frames(2)
+    natural = [len(f) for f in frames]
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(frames, eotl_entries=[natural[0], natural[1] + 2]))
+
+
+def test_extended_length_ignores_item_headers():
+    # Lengths cover fragment payloads only; adding the 8-byte item header of
+    # the frame's single fragment must be rejected as a contradiction.
+    frames = _frames(2)
+    natural = [len(f) for f in frames]
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(frames, eotl_entries=[natural[0] + 8, natural[1]]))
+
+
+def test_extended_offsets_table_wrong_vr_rejected():
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(_frames(2), eot_vr="OW"))
+
+
+def test_extended_value_length_not_multiple_of_8():
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(_frames(1), eot_value=b"\x00" * 4))
+
+
+def test_extended_declared_frame_count_mismatch():
+    # Tables carry 2 entries but Number of Frames declares 3.
+    with raises_dicom_error(INVALID_EXTENDED_OFFSET_TABLE):
+        parse_dicom(_extended(_frames(2), declared_frames=3))
 
 
 # --------------------------------------------------------------------------- #

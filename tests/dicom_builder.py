@@ -102,6 +102,41 @@ def jpeg_stream(seed: int = 0, *, sof_marker: int = 0xC0, with_restart: bool = F
 # Encapsulated pixel data
 # --------------------------------------------------------------------------- #
 
+def _layout_items(
+    normalized: list[list[bytes]],
+    *,
+    undefined_fragment_items: bool = False,
+) -> tuple[bytes, list[int], list[int]]:
+    """Serialize fragment items and compute the natural frame boundaries.
+
+    Returns ``(items, offsets, lengths)`` where ``offsets`` are the per-frame
+    item-tag offsets relative to the first fragment item (the Basic/Extended
+    Offset Table origin) and ``lengths`` are the per-frame sums of fragment
+    payload lengths (the Extended Offset Table Lengths semantics).
+    """
+    items = bytearray()
+    offsets: list[int] = []
+    lengths: list[int] = []
+    for fragments in normalized:
+        frame_length = 0
+        for j, payload in enumerate(fragments):
+            if j == 0:
+                offsets.append(len(items))
+            # A conformant encoder pads the LAST fragment of a frame to an even
+            # item length with a single NUL after the encoded stream. Test
+            # cuts are chosen so non-last fragments are already even.
+            if j == len(fragments) - 1 and len(payload) % 2:
+                payload = payload + b"\x00"
+            frame_length += len(payload)
+            if undefined_fragment_items:
+                items += item_header(ITEM, UNDEFINED) + payload
+                items += item_header(ITEM_DELIM, 0)
+            else:
+                items += item_header(ITEM, len(payload)) + payload
+        lengths.append(frame_length)
+    return bytes(items), offsets, lengths
+
+
 def encapsulated_pixel_data(
     frame_fragments: list[list[bytes]],
     *,
@@ -112,23 +147,10 @@ def encapsulated_pixel_data(
     sequence_delim_length: int = 0,
 ) -> bytes:
     """Build the value-stream of an undefined-length OB Pixel Data element."""
-    items = bytearray()
-    natural_offsets: list[int] = []
     normalized = [[f] if isinstance(f, (bytes, bytearray)) else list(f) for f in frame_fragments]
-    for fragments in normalized:
-        for j, payload in enumerate(fragments):
-            if j == 0:
-                natural_offsets.append(len(items))
-            # A conformant encoder pads the LAST fragment of a frame to an even
-            # item length with a single NUL after the encoded stream. Test
-            # cuts are chosen so non-last fragments are already even.
-            if j == len(fragments) - 1 and len(payload) % 2:
-                payload = payload + b"\x00"
-            if undefined_fragment_items:
-                items += item_header(ITEM, UNDEFINED) + payload
-                items += item_header(ITEM_DELIM, 0)
-            else:
-                items += item_header(ITEM, len(payload)) + payload
+    items, natural_offsets, _ = _layout_items(
+        normalized, undefined_fragment_items=undefined_fragment_items
+    )
 
     if bot_value is None:
         entries = natural_offsets if bot_entries is None else bot_entries
@@ -136,7 +158,7 @@ def encapsulated_pixel_data(
     length = bot_item_length if bot_item_length is not None else len(bot_value)
     bot = item_header(ITEM, length) + bot_value
 
-    return bytes(bot) + bytes(items) + item_header(SEQ_DELIM, sequence_delim_length)
+    return bytes(bot) + items + item_header(SEQ_DELIM, sequence_delim_length)
 
 
 # --------------------------------------------------------------------------- #
@@ -164,6 +186,14 @@ def build_dicom(
     undefined_prefix_element: bool = False,
     extra_before_pixel: bytes = b"",
     extra_after_number: bytes = b"",
+    extended: bool = False,
+    eot_entries: list[int] | None = None,
+    eotl_entries: list[int] | None = None,
+    eot_value: bytes | None = None,
+    eotl_value: bytes | None = None,
+    eot_vr: str = "OV",
+    include_eot: bool = True,
+    include_eotl: bool = True,
 ) -> bytes:
     normalized: list[list[bytes]] = [[f] if isinstance(f, (bytes, bytearray)) else list(f) for f in frames]
     nframes = declared_frames if declared_frames is not None else len(normalized)
@@ -191,6 +221,22 @@ def build_dicom(
     if undefined_prefix_element:
         # (0028,1101) RedPaletteColorLookupTableData SQ with undefined length.
         dataset += struct.pack("<HHBBHI", 0x0028, 0x1101, ord("S"), ord("Q"), 0, UNDEFINED)
+
+    if extended:
+        # Extended Offset Table pair: dataset elements (OV) that precede Pixel
+        # Data. Natural values are derived from the same fragment layout used
+        # for the encapsulated stream; overrides allow targeted corruption.
+        _, natural_offsets, natural_lengths = _layout_items(normalized)
+        if eot_value is None:
+            entries = natural_offsets if eot_entries is None else eot_entries
+            eot_value = struct.pack(f"<{len(entries)}Q", *entries) if entries else b""
+        if eotl_value is None:
+            entries = natural_lengths if eotl_entries is None else eotl_entries
+            eotl_value = struct.pack(f"<{len(entries)}Q", *entries) if entries else b""
+        if include_eot:
+            dataset += evr(0x7FE0, 0x0001, eot_vr, eot_value)
+        if include_eotl:
+            dataset += evr(0x7FE0, 0x0002, "OV", eotl_value)
 
     if pixel_data_stream is None:
         pixel_data_stream = encapsulated_pixel_data(

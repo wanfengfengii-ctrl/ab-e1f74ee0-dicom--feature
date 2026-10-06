@@ -14,6 +14,7 @@ from app.errors import (
     FILE_TOO_LARGE,
     FRAME_INDEX_OUT_OF_RANGE,
     INVALID_BASIC_OFFSET_TABLE,
+    INVALID_EXTENDED_OFFSET_TABLE,
     INVALID_FRAME_INDEX,
     INVALID_PREAMBLE,
     NO_FRAME_INDICES,
@@ -21,7 +22,7 @@ from app.errors import (
     UNSUPPORTED_TRANSFER_SYNTAX,
 )
 from app.main import MAX_FILE_BYTES, app
-from tests.dicom_builder import build_dicom, jpeg_stream, split_frame
+from tests.dicom_builder import _layout_items, build_dicom, jpeg_stream, split_frame
 
 BOUNDARY = "----dicomtestboundary42"
 
@@ -264,6 +265,89 @@ async def test_one_bad_frame_fails_whole_request():
     body = encode_multipart([("frames", "0")], [("file", "bad.dcm", blob)])
     resp = await _post(body)
     assert resp.status_code == 422
+    assert "frames" not in resp.json()
+
+
+# --------------------------------------------------------------------------- #
+# Extended Offset Table files (empty BOT + (7FE0,0001)/(7FE0,0002))
+# --------------------------------------------------------------------------- #
+
+def _extended_blob(**kwargs):
+    frames = _frames(4, multi=(2,))
+    kwargs.setdefault("extended", True)
+    kwargs.setdefault("bot_entries", [])
+    return frames, build_dicom(frames, **kwargs)
+
+
+async def test_extended_tables_valid_file_returns_verbatim_frames():
+    frames, blob = _extended_blob()
+    body = encode_multipart(_frames_fields([2, 0]), [("file", "ext.dcm", blob)])
+    resp = await _post(body)
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["number_of_frames"] == 4
+    assert [f["index"] for f in payload["frames"]] == [2, 0]
+    for returned, expected_frags in zip(payload["frames"], [frames[2], frames[0]]):
+        joined = expected_frags if isinstance(expected_frags, bytes) else b"".join(expected_frags)
+        assert returned["byte_count"] == len(joined)
+        assert returned["fragment_count"] == (1 if isinstance(expected_frags, bytes) else len(expected_frags))
+        assert base64.b64decode(returned["data"]) == joined
+        assert returned["sha256"] == hashlib.sha256(joined).hexdigest()
+
+
+async def test_extended_tables_byte_stable_across_requests():
+    _, blob = _extended_blob()
+    digests = []
+    for _ in range(2):
+        body = encode_multipart(_frames_fields([1, 3]), [("file", "ext.dcm", blob)])
+        resp = await _post(body)
+        assert resp.status_code == 200
+        digests.append([(f["sha256"], f["data"], f["byte_count"], f["fragment_count"])
+                        for f in resp.json()["frames"]])
+    assert digests[0] == digests[1]
+
+
+async def test_extended_length_mismatch_rejected_no_partial_frames():
+    frames, _ = _extended_blob()
+    natural = [len(f) if isinstance(f, bytes) else sum(len(p) for p in f) for f in frames]
+    natural[1] += 2  # contradict the fragment extent of frame 1
+    _, blob = _extended_blob(eotl_entries=natural)
+    body = encode_multipart([("frames", "0")], [("file", "bad.dcm", blob)])
+    resp = await _post(body)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["type"] == INVALID_EXTENDED_OFFSET_TABLE
+    assert set(resp.json()) == {"error"}
+
+
+async def test_extended_missing_pair_rejected():
+    _, blob = _extended_blob(include_eotl=False)
+    body = encode_multipart([("frames", "0")], [("file", "bad.dcm", blob)])
+    resp = await _post(body)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["type"] == INVALID_EXTENDED_OFFSET_TABLE
+    assert "frames" not in resp.json()
+
+
+async def test_extended_mixed_with_nonempty_bot_rejected():
+    frames = _frames(2)
+    blob = build_dicom(frames, extended=True)  # natural non-empty BOT + extended pair
+    body = encode_multipart([("frames", "0")], [("file", "bad.dcm", blob)])
+    resp = await _post(body)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["type"] == INVALID_EXTENDED_OFFSET_TABLE
+    assert "frames" not in resp.json()
+
+
+async def test_extended_offset_out_of_range_rejected():
+    frames = _frames(4, multi=(2,))
+    normalized = [[f] if isinstance(f, bytes) else list(f) for f in frames]
+    _, natural_offsets, _ = _layout_items(normalized)
+    natural_offsets[-1] = 999999  # past every fragment item boundary
+    blob = build_dicom(frames, extended=True, bot_entries=[], eot_entries=natural_offsets)
+    body = encode_multipart([("frames", "0")], [("file", "bad.dcm", blob)])
+    resp = await _post(body)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["type"] == INVALID_EXTENDED_OFFSET_TABLE
     assert "frames" not in resp.json()
 
 

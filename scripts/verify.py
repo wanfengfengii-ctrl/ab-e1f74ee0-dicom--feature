@@ -9,8 +9,13 @@ Sequence (the process exits non-zero on the first failed stage):
    * a valid single-frame request and a valid multi-frame / multi-fragment
      request, asserting verbatim Base64 payloads, fragment counts, byte
      counts and SHA-256, plus byte-for-byte stability across repeated calls;
+   * a valid file using an empty Basic Offset Table with the Extended Offset
+     Table / Extended Offset Table Lengths pair, asserting verbatim payloads
+     and request ordering;
    * a file with a corrupt Basic Offset Table, asserting the stable error
-     type and the absence of any partial frame response.
+     type and the absence of any partial frame response;
+   * a file whose Extended Offset Table Lengths contradict the fragment
+     layout, asserting the stable error type and no partial frame response.
 """
 
 from __future__ import annotations
@@ -181,6 +186,66 @@ def smoke_bad_offset_table() -> None:
     print("bad offset table OK (HTTP 422 INVALID_BASIC_OFFSET_TABLE, no frames)", flush=True)
 
 
+def smoke_valid_extended_offset_tables() -> None:
+    _step("API smoke: valid empty-BOT file with Extended Offset Table pair")
+    f0 = jpeg_stream(seed=41)
+    f1_full = jpeg_stream(seed=42, with_restart=True)
+    f1_parts = split_frame(f1_full, (8, 24))  # 3 fragments, cuts are even
+    f2 = jpeg_stream(seed=43)
+    blob = build_dicom([f0, f1_parts, f2], extended=True, bot_entries=[])
+
+    def call():
+        body, headers = _multipart([2, 0, 1], blob)
+        resp = httpx.post(FRAMES_URL, content=body, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            fail(f"valid extended-table request returned {resp.status_code}: {resp.text}")
+        return resp.json()
+
+    first = call()
+    second = call()
+    if first != second:
+        fail("repeated extended-table requests did not return byte-identical responses")
+
+    if first["number_of_frames"] != 3 or [f["index"] for f in first["frames"]] != [2, 0, 1]:
+        fail(f"unexpected extended-table response envelope: {first}")
+
+    expected = {0: (f0, 1), 1: (f1_full, 3), 2: (f2, 1)}
+    by_index = {f["index"]: f for f in first["frames"]}
+    for index, (raw, frag_count) in expected.items():
+        frame = by_index[index]
+        if base64.b64decode(frame["data"]) != raw:
+            fail(f"extended-table frame {index} payload is not the concatenated raw fragments")
+        if frame["fragment_count"] != frag_count:
+            fail(f"extended-table frame {index} fragment_count {frame['fragment_count']} != {frag_count}")
+        if frame["byte_count"] != len(raw):
+            fail(f"extended-table frame {index} byte_count {frame['byte_count']} != {len(raw)}")
+        if frame["sha256"] != hashlib.sha256(raw).hexdigest():
+            fail(f"extended-table frame {index} sha256 mismatch")
+    print("extended offset tables OK and byte-stable", flush=True)
+
+
+def smoke_extended_length_mismatch() -> None:
+    _step("API smoke: Extended Offset Table Lengths mismatch must fail with a stable error type")
+    f0 = jpeg_stream(seed=51)
+    f1 = jpeg_stream(seed=52)
+    blob = build_dicom(
+        [f0, f1],
+        extended=True,
+        bot_entries=[],
+        eotl_entries=[len(f0), len(f1) + 2],  # contradicts the fragment extent of frame 1
+    )
+    body, headers = _multipart([0, 1], blob)
+    resp = httpx.post(FRAMES_URL, content=body, headers=headers, timeout=10)
+    if resp.status_code != 422:
+        fail(f"extended length mismatch expected HTTP 422, got {resp.status_code}: {resp.text}")
+    payload = resp.json()
+    if payload.get("error", {}).get("type") != "INVALID_EXTENDED_OFFSET_TABLE":
+        fail(f"extended length mismatch returned unexpected error payload: {payload}")
+    if "frames" in payload:
+        fail("extended length mismatch response must not contain any partial frame data")
+    print("extended length mismatch OK (HTTP 422 INVALID_EXTENDED_OFFSET_TABLE, no frames)", flush=True)
+
+
 def main() -> None:
     print(f"verify starting against {API_BASE_URL}", flush=True)
     wait_for_health()
@@ -188,7 +253,9 @@ def main() -> None:
     build_application()
     smoke_valid_single_frame()
     smoke_valid_multifragment_and_stable()
+    smoke_valid_extended_offset_tables()
     smoke_bad_offset_table()
+    smoke_extended_length_mismatch()
     print("\nVERIFY PASSED", flush=True)
 
 
