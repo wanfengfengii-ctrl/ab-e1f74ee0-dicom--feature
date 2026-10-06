@@ -1,0 +1,6 @@
+fastapi==0.142.2
+uvicorn[standard]==0.54.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+httpx==0.28.1
+pydicom==3.0.2
