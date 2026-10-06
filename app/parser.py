@@ -7,9 +7,24 @@ Accepted subset (anything else is rejected with a stable error type):
   correct (0002,0000) group length landing on an element boundary.
 * Main dataset: Explicit VR Little Endian only.
 * Exactly one Pixel Data element (7FE0,0010), encapsulated
-  (undefined length), containing a complete Basic Offset Table whose
-  offsets are zero-based (first == 0), strictly increasing, one per
-  declared frame, each landing on a fragment item boundary.
+  (undefined length, VR OB), ending at the last element boundary. Frame
+  boundaries are supplied by exactly one of the two mechanisms below:
+
+  - a complete Basic Offset Table (the BOT item inside the Pixel Data
+    element) whose offsets are zero-based (first == 0), strictly
+    increasing, one per declared frame, each landing on a fragment item
+    boundary; or
+  - an *empty* Basic Offset Table (item length 0) paired with the two
+    Extended Offset Table elements (7FE0,0001) and (7FE0,0002). Both must
+    precede Pixel Data, use Explicit VR Little Endian VR OV with finite,
+    8-byte-aligned lengths, and carry exactly one 64-bit entry per
+    declared frame. Offsets are zero-based (first == 0), strictly
+    increasing and each lands on a fragment item boundary; lengths equal
+    the total fragment payload (excluding item headers) of the frame.
+
+  A non-empty Basic Offset Table must never be combined with Extended
+  Offset Table elements, and the two extended elements always appear
+  together.
 * Pixel data encoded with JPEG Baseline (1.2.840.10008.1.2.4.50).
 * Every element before/after Pixel Data has a finite (explicit) length
   and lands on a clean boundary; the file ends exactly at the last
@@ -29,6 +44,7 @@ from dataclasses import dataclass
 from .errors import (
     DicomError,
     INVALID_BASIC_OFFSET_TABLE,
+    INVALID_EXTENDED_OFFSET_TABLE,
     INVALID_FRAME_DECLARATION,
     INVALID_JPEG_STREAM,
     INVALID_METADATA,
@@ -47,6 +63,8 @@ DICM = b"DICM"
 TAG_FILE_META_INFO_LENGTH = 0x00020000
 TAG_TRANSFER_SYNTAX_UID = 0x00020010
 TAG_NUMBER_OF_FRAMES = 0x00280008
+TAG_EXTENDED_OFFSET_TABLE = 0x7FE00001
+TAG_EXTENDED_OFFSET_TABLE_LENGTHS = 0x7FE00002
 TAG_PIXEL_DATA = 0x7FE00010
 
 ITEM_TAG = 0xFFFEE000
@@ -85,6 +103,14 @@ class Frame:
 class ParsedDicom:
     number_of_frames: int
     frames: list[Frame]
+
+
+@dataclass(frozen=True)
+class ExtendedOffsetTables:
+    """The paired (7FE0,0001)/(7FE0,0002) values read ahead of Pixel Data."""
+
+    offsets: list[int]
+    lengths: list[int]
 
 
 # --------------------------------------------------------------------------- #
@@ -194,6 +220,8 @@ def parse_dicom(blob: bytes) -> ParsedDicom:
     frames: list[Frame] | None = None
     pixel_data_seen = False
     previous_tag: int | None = None
+    extended_offsets: list[int] | None = None
+    extended_lengths: list[int] | None = None
 
     while not r.eof():
         tag, vr, length = _read_element_header(
@@ -222,6 +250,25 @@ def parse_dicom(blob: bytes) -> ParsedDicom:
             number_of_frames = _parse_frame_count(r.take(length, TRUNCATED_DATA, "Number of Frames value"))
             continue
 
+        if tag in (TAG_EXTENDED_OFFSET_TABLE, TAG_EXTENDED_OFFSET_TABLE_LENGTHS):
+            name = (
+                "Extended Offset Table (7FE0,0001)"
+                if tag == TAG_EXTENDED_OFFSET_TABLE
+                else "Extended Offset Table Lengths (7FE0,0002)"
+            )
+            if pixel_data_seen:
+                raise DicomError(INVALID_EXTENDED_OFFSET_TABLE, f"{name} must appear before Pixel Data")
+            if vr != "OV":
+                raise DicomError(INVALID_EXTENDED_OFFSET_TABLE, f"{name} must use Explicit VR OV (found {vr})")
+            entries = _parse_extended_table_entries(
+                r.take(length, TRUNCATED_DATA, f"{name} value"), name
+            )
+            if tag == TAG_EXTENDED_OFFSET_TABLE:
+                extended_offsets = entries
+            else:
+                extended_lengths = entries
+            continue
+
         if tag == TAG_PIXEL_DATA:
             if vr != "OB":
                 raise DicomError(
@@ -230,7 +277,22 @@ def parse_dicom(blob: bytes) -> ParsedDicom:
                 )
             if length != UNDEFINED_LENGTH:
                 raise DicomError(PIXEL_DATA_STRUCTURE, "Encapsulated Pixel Data must have undefined length")
-            frames = _parse_encapsulated_pixel_data(r)
+
+            # The two Extended Offset Table elements are a pair and only make
+            # sense together.
+            if (extended_offsets is None) != (extended_lengths is None):
+                raise DicomError(
+                    INVALID_EXTENDED_OFFSET_TABLE,
+                    "Extended Offset Table (7FE0,0001) and Extended Offset Table "
+                    "Lengths (7FE0,0002) must be present together",
+                )
+            extended = (
+                ExtendedOffsetTables(offsets=extended_offsets, lengths=extended_lengths)
+                if extended_offsets is not None and extended_lengths is not None
+                else None
+            )
+
+            frames = _parse_encapsulated_pixel_data(r, extended)
             pixel_data_seen = True
             # Pixel Data must be the final element: the finite-length element
             # requirement is scoped to the elements preceding it, and the
@@ -254,7 +316,13 @@ def parse_dicom(blob: bytes) -> ParsedDicom:
         )
 
     assert frames is not None
-    if len(frames) != number_of_frames:
+    if extended is not None:
+        if len(frames) != number_of_frames:
+            raise DicomError(
+                INVALID_EXTENDED_OFFSET_TABLE,
+                f"Extended Offset Table yields {len(frames)} frames but Number of Frames is {number_of_frames}",
+            )
+    elif len(frames) != number_of_frames:
         raise DicomError(
             INVALID_BASIC_OFFSET_TABLE,
             f"Basic Offset Table yields {len(frames)} frames but Number of Frames is {number_of_frames}",
@@ -264,6 +332,16 @@ def parse_dicom(blob: bytes) -> ParsedDicom:
         _validate_jpeg_baseline(frame, idx)
 
     return ParsedDicom(number_of_frames=number_of_frames, frames=frames)
+
+
+def _parse_extended_table_entries(raw: bytes, name: str) -> list[int]:
+    """Decode one Extended Offset Table value: packed little-endian UINT64."""
+    if len(raw) == 0:
+        raise DicomError(INVALID_EXTENDED_OFFSET_TABLE, f"{name} must not be empty")
+    if len(raw) % 8 != 0:
+        raise DicomError(INVALID_EXTENDED_OFFSET_TABLE, f"{name} length must be a multiple of 8")
+    count = len(raw) // 8
+    return list(struct.unpack(f"<{count}Q", raw))
 
 
 # --------------------------------------------------------------------------- #
@@ -350,8 +428,16 @@ def _parse_frame_count(raw: bytes) -> int:
 # Encapsulated Pixel Data (PS3.5 A.4)
 # --------------------------------------------------------------------------- #
 
-def _parse_encapsulated_pixel_data(r: _Reader) -> list[Frame]:
-    """Parse the item stream following an undefined-length Pixel Data header."""
+def _parse_encapsulated_pixel_data(
+    r: _Reader,
+    extended: ExtendedOffsetTables | None,
+) -> list[Frame]:
+    """Parse the item stream following an undefined-length Pixel Data header.
+
+    When ``extended`` is ``None`` frame boundaries come from a complete Basic
+    Offset Table; otherwise the BOT item must be empty and boundaries come from
+    the paired Extended Offset Table / Extended Offset Table Lengths.
+    """
 
     # The very first item must be the Basic Offset Table item (FFFE,E000).
     tag, bot_length = _read_item_tag(r, PIXEL_DATA_STRUCTURE, "Basic Offset Table item header")
@@ -363,12 +449,12 @@ def _parse_encapsulated_pixel_data(r: _Reader) -> list[Frame]:
         raise DicomError(INVALID_BASIC_OFFSET_TABLE, "Basic Offset Table length must be a multiple of 4")
 
     bot_bytes = r.take(bot_length, TRUNCATED_DATA, "Basic Offset Table entries")
-    # BOT offsets are measured from the first byte after the BOT item, which
+    # Offset tables are measured from the first byte after the BOT item, which
     # must be the tag of the first fragment item (no padding allowed).
     origin = r.pos
 
     count = bot_length // 4
-    offsets = list(struct.unpack(f"<{count}I", bot_bytes)) if count else []
+    bot_offsets = list(struct.unpack(f"<{count}I", bot_bytes)) if count else []
 
     fragments: list[tuple[int, bytes]] = []  # (absolute file offset of item tag, payload)
     while True:
@@ -397,30 +483,81 @@ def _parse_encapsulated_pixel_data(r: _Reader) -> list[Frame]:
     if not fragments:
         raise DicomError(PIXEL_DATA_STRUCTURE, "Encapsulated pixel data contains no fragment items")
     if fragments[0][0] != origin:
-        raise DicomError(INVALID_BASIC_OFFSET_TABLE, "Bytes between Basic Offset Table and first fragment item")
-    if not offsets:
-        raise DicomError(INVALID_BASIC_OFFSET_TABLE, "Empty Basic Offset Table is not accepted (frame boundaries would be ambiguous)")
+        table_error = INVALID_EXTENDED_OFFSET_TABLE if extended is not None else INVALID_BASIC_OFFSET_TABLE
+        raise DicomError(table_error, "Bytes between the offset table and the first fragment item")
 
-    return _group_fragments_into_frames(fragments, origin, offsets)
+    if extended is not None:
+        if bot_offsets:
+            raise DicomError(
+                INVALID_EXTENDED_OFFSET_TABLE,
+                "Extended Offset Tables must not be combined with a non-empty Basic Offset Table",
+            )
+        return _group_fragments_extended(fragments, origin, extended)
+
+    if not bot_offsets:
+        raise DicomError(
+            INVALID_BASIC_OFFSET_TABLE,
+            "Empty Basic Offset Table is not accepted without Extended Offset Tables "
+            "(frame boundaries would be ambiguous)",
+        )
+
+    return _frames_from_boundaries(
+        fragments, origin, bot_offsets, INVALID_BASIC_OFFSET_TABLE, "Basic Offset Table"
+    )
 
 
-def _group_fragments_into_frames(
+def _group_fragments_extended(
+    fragments: list[tuple[int, bytes]],
+    origin: int,
+    extended: ExtendedOffsetTables,
+) -> list[Frame]:
+    if len(extended.offsets) != len(extended.lengths):
+        raise DicomError(
+            INVALID_EXTENDED_OFFSET_TABLE,
+            "Extended Offset Table and Extended Offset Table Lengths must have the same number of entries",
+        )
+
+    frames = _frames_from_boundaries(
+        fragments,
+        origin,
+        extended.offsets,
+        INVALID_EXTENDED_OFFSET_TABLE,
+        "Extended Offset Table",
+    )
+
+    # Each declared length must equal the complete fragment range covered by
+    # its frame, i.e. the sum of the fragment item payloads (item tags and
+    # item-length fields are not part of the encoded frame length).
+    for i, frame in enumerate(frames):
+        if extended.lengths[i] != frame.byte_count:
+            raise DicomError(
+                INVALID_EXTENDED_OFFSET_TABLE,
+                f"Extended Offset Table Lengths entry {i} is {extended.lengths[i]} but the frame "
+                f"covers {frame.byte_count} fragment payload bytes",
+            )
+
+    return frames
+
+
+def _frames_from_boundaries(
     fragments: list[tuple[int, bytes]],
     origin: int,
     offsets: list[int],
+    error_type: str,
+    table_label: str,
 ) -> list[Frame]:
     # Validate offset semantics first, so every failure is reported as a
     # bad offset table rather than guessed from fragment layout.
     if offsets[0] != 0:
-        raise DicomError(INVALID_BASIC_OFFSET_TABLE, "First Basic Offset Table entry must be 0")
+        raise DicomError(error_type, f"First {table_label} entry must be 0")
     for i in range(1, len(offsets)):
         if offsets[i] <= offsets[i - 1]:
-            raise DicomError(INVALID_BASIC_OFFSET_TABLE, "Basic Offset Table entries must be strictly increasing")
+            raise DicomError(error_type, f"{table_label} entries must be strictly increasing")
 
     relative_boundaries = {item_off - origin for item_off, _ in fragments}
     for off in offsets:
         if off not in relative_boundaries:
-            raise DicomError(INVALID_BASIC_OFFSET_TABLE, f"Offset {off} does not land on a fragment item boundary")
+            raise DicomError(error_type, f"{table_label} offset {off} does not land on a fragment item boundary")
 
     # Map each declared offset to the ordinal of the fragment starting there.
     starts_abs = [origin + off for off in offsets]
@@ -428,7 +565,7 @@ def _group_fragments_into_frames(
     fi = 0
     for i, start_abs in enumerate(starts_abs):
         if fi >= len(fragments) or fragments[fi][0] != start_abs:
-            raise DicomError(INVALID_BASIC_OFFSET_TABLE, f"Frame {i} offset does not coincide with a fragment item start")
+            raise DicomError(error_type, f"Frame {i} offset does not coincide with a fragment item start")
         next_start = starts_abs[i + 1] if i + 1 < len(starts_abs) else None
 
         gathered: list[bytes] = []
@@ -439,11 +576,11 @@ def _group_fragments_into_frames(
             gathered.append(payload)
             fi += 1
         if not gathered:
-            raise DicomError(INVALID_BASIC_OFFSET_TABLE, f"Frame {i} contains no fragments")
+            raise DicomError(error_type, f"Frame {i} contains no fragments")
         frames.append(Frame(data=b"".join(gathered), fragment_count=len(gathered)))
 
     if fi != len(fragments):
-        raise DicomError(INVALID_BASIC_OFFSET_TABLE, "Fragments exist that are not covered by any frame offset")
+        raise DicomError(error_type, "Fragments exist that are not covered by any frame offset")
 
     return frames
 

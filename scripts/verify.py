@@ -9,8 +9,12 @@ Sequence (the process exits non-zero on the first failed stage):
    * a valid single-frame request and a valid multi-frame / multi-fragment
      request, asserting verbatim Base64 payloads, fragment counts, byte
      counts and SHA-256, plus byte-for-byte stability across repeated calls;
-   * a file with a corrupt Basic Offset Table, asserting the stable error
-     type and the absence of any partial frame response.
+   * a valid Extended Offset Table file (empty Basic Offset Table plus
+     (7FE0,0001)/(7FE0,0002)), asserting the same verbatim guarantees;
+   * a file with a corrupt Basic Offset Table and a file whose Extended
+     Offset Table Lengths disagree with the covered fragment range, each
+     asserting the stable error type and the absence of any partial frame
+     response.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import struct
 import subprocess
 import sys
 import time
@@ -181,6 +186,66 @@ def smoke_bad_offset_table() -> None:
     print("bad offset table OK (HTTP 422 INVALID_BASIC_OFFSET_TABLE, no frames)", flush=True)
 
 
+def smoke_valid_extended_offset_table() -> None:
+    _step("API smoke: valid Extended Offset Table file (empty BOT + (7FE0,0001/0002))")
+    f0 = jpeg_stream(seed=41)
+    f1_full = jpeg_stream(seed=42, with_restart=True)
+    f1_parts = split_frame(f1_full, (8, 24))  # 3 fragments, cuts are even
+    f2 = jpeg_stream(seed=43)
+    frames = [f0, f1_parts, f2]
+    blob = build_dicom(frames, extended=True)
+
+    def call():
+        body, headers = _multipart([2, 0, 1], blob)
+        resp = httpx.post(FRAMES_URL, content=body, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            fail(f"valid extended-table request returned {resp.status_code}: {resp.text}")
+        return resp.json()
+
+    first = call()
+    second = call()
+    if first != second:
+        fail("extended-table: repeated requests did not return byte-identical responses")
+    if [f["index"] for f in first["frames"]] != [2, 0, 1]:
+        fail("extended-table: response did not preserve request frame order")
+
+    expected = {0: (f0, 1), 1: (f1_full, 3), 2: (f2, 1)}
+    by_index = {f["index"]: f for f in first["frames"]}
+    for index, (raw, frag_count) in expected.items():
+        frame = by_index[index]
+        if base64.b64decode(frame["data"]) != raw:
+            fail(f"extended-table: frame {index} payload is not the concatenated raw fragments")
+        if frame["fragment_count"] != frag_count:
+            fail(f"extended-table: frame {index} fragment_count {frame['fragment_count']} != {frag_count}")
+        if frame["byte_count"] != len(raw):
+            fail(f"extended-table: frame {index} byte_count {frame['byte_count']} != {len(raw)}")
+        if frame["sha256"] != hashlib.sha256(raw).hexdigest():
+            fail(f"extended-table: frame {index} sha256 mismatch")
+    print("Extended Offset Table OK (verbatim frames, multi-fragment, byte-stable)", flush=True)
+
+
+def smoke_bad_extended_lengths() -> None:
+    _step("API smoke: inconsistent Extended Offset Table Lengths must fail with a stable error type")
+    f0 = jpeg_stream(seed=51)
+    f1 = jpeg_stream(seed=52)
+    # Both declared lengths intentionally wrong (too small) -> length/range conflict.
+    bad_lengths = struct.pack("<2Q", 1, 1)
+    blob = build_dicom([f0, f1], extended=True, ext_lengths_raw=bad_lengths)
+    body, headers = _multipart([0, 1], blob)
+    resp = httpx.post(FRAMES_URL, content=body, headers=headers, timeout=10)
+    if resp.status_code != 422:
+        fail(f"bad extended lengths expected HTTP 422, got {resp.status_code}: {resp.text}")
+    payload = resp.json()
+    if payload.get("error", {}).get("type") != "INVALID_EXTENDED_OFFSET_TABLE":
+        fail(f"bad extended lengths returned unexpected error payload: {payload}")
+    if "frames" in payload:
+        fail("bad extended lengths response must not contain any partial frame data")
+    print(
+        "bad extended lengths OK (HTTP 422 INVALID_EXTENDED_OFFSET_TABLE, no frames)",
+        flush=True,
+    )
+
+
 def main() -> None:
     print(f"verify starting against {API_BASE_URL}", flush=True)
     wait_for_health()
@@ -189,6 +254,8 @@ def main() -> None:
     smoke_valid_single_frame()
     smoke_valid_multifragment_and_stable()
     smoke_bad_offset_table()
+    smoke_valid_extended_offset_table()
+    smoke_bad_extended_lengths()
     print("\nVERIFY PASSED", flush=True)
 
 

@@ -114,16 +114,11 @@ def encapsulated_pixel_data(
     """Build the value-stream of an undefined-length OB Pixel Data element."""
     items = bytearray()
     natural_offsets: list[int] = []
-    normalized = [[f] if isinstance(f, (bytes, bytearray)) else list(f) for f in frame_fragments]
+    normalized = _normalized_padded_fragments(frame_fragments)
     for fragments in normalized:
         for j, payload in enumerate(fragments):
             if j == 0:
                 natural_offsets.append(len(items))
-            # A conformant encoder pads the LAST fragment of a frame to an even
-            # item length with a single NUL after the encoded stream. Test
-            # cuts are chosen so non-last fragments are already even.
-            if j == len(fragments) - 1 and len(payload) % 2:
-                payload = payload + b"\x00"
             if undefined_fragment_items:
                 items += item_header(ITEM, UNDEFINED) + payload
                 items += item_header(ITEM_DELIM, 0)
@@ -137,6 +132,46 @@ def encapsulated_pixel_data(
     bot = item_header(ITEM, length) + bot_value
 
     return bytes(bot) + bytes(items) + item_header(SEQ_DELIM, sequence_delim_length)
+
+
+def _normalized_padded_fragments(frame_fragments: list[list[bytes]]) -> list[list[bytes]]:
+    """Normalize frames to fragment lists and pad the last fragment of each
+    frame to an even item length, exactly as ``encapsulated_pixel_data``."""
+    normalized = [[f] if isinstance(f, (bytes, bytearray)) else list(f) for f in frame_fragments]
+    for fragments in normalized:
+        last = fragments[-1]
+        if isinstance(last, (bytes, bytearray)) and len(last) % 2:
+            fragments[-1] = bytes(last) + b"\x00"
+    return normalized
+
+
+def extended_offset_values(
+    frame_fragments: list[list[bytes]],
+) -> tuple[bytes, bytes]:
+    """Return packed little-endian (offsets, lengths) for an Extended Offset
+    Table pair.
+
+    Offsets are 64-bit and measured from the item tag of the first fragment
+    (the byte immediately following the empty Basic Offset Table item); the
+    first offset is 0. Lengths are the summed fragment *payload* bytes per
+    frame (item headers excluded), matching the padding applied by
+    :func:`encapsulated_pixel_data`.
+    """
+    normalized = _normalized_padded_fragments(frame_fragments)
+    offsets: list[int] = []
+    lengths: list[int] = []
+    cursor = 0
+    for fragments in normalized:
+        offsets.append(cursor)
+        frame_payload = 0
+        for payload in fragments:
+            frame_payload += len(payload)
+            cursor += 8 + len(payload)  # item tag + item length precede payload
+        lengths.append(frame_payload)
+    return (
+        struct.pack(f"<{len(offsets)}Q", *offsets),
+        struct.pack(f"<{len(lengths)}Q", *lengths),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -164,6 +199,13 @@ def build_dicom(
     undefined_prefix_element: bool = False,
     extra_before_pixel: bytes = b"",
     extra_after_number: bytes = b"",
+    extended: bool = False,
+    ext_offsets_raw: bytes | None = None,
+    ext_lengths_raw: bytes | None = None,
+    ext_include_offsets: bool = True,
+    ext_include_lengths: bool = True,
+    ext_offsets_vr: str = "OV",
+    ext_lengths_vr: str = "OV",
 ) -> bytes:
     normalized: list[list[bytes]] = [[f] if isinstance(f, (bytes, bytearray)) else list(f) for f in frames]
     nframes = declared_frames if declared_frames is not None else len(normalized)
@@ -192,10 +234,26 @@ def build_dicom(
         # (0028,1101) RedPaletteColorLookupTableData SQ with undefined length.
         dataset += struct.pack("<HHBBHI", 0x0028, 0x1101, ord("S"), ord("Q"), 0, UNDEFINED)
 
+    # Extended Offset Table pair (7FE0,0001)/(7FE0,0002): always immediately
+    # before Pixel Data so tag order is preserved.
+    if extended:
+        natural_offsets, natural_lengths = extended_offset_values(normalized)
+        offsets_value = ext_offsets_raw if ext_offsets_raw is not None else natural_offsets
+        lengths_value = ext_lengths_raw if ext_lengths_raw is not None else natural_lengths
+        if ext_include_offsets:
+            dataset += evr(0x7FE0, 0x0001, ext_offsets_vr, offsets_value)
+        if ext_include_lengths:
+            dataset += evr(0x7FE0, 0x0002, ext_lengths_vr, lengths_value)
+
     if pixel_data_stream is None:
+        # Extended mode implies an empty Basic Offset Table unless a test
+        # deliberately overrides it (the "mixed" corruption case).
+        force_empty_bot = (
+            extended and bot_entries is None and bot_value is None and bot_item_length is None
+        )
         pixel_data_stream = encapsulated_pixel_data(
             normalized,
-            bot_entries=bot_entries,
+            bot_entries=[] if force_empty_bot else bot_entries,
             bot_value=bot_value,
             bot_item_length=bot_item_length,
             undefined_fragment_items=undefined_fragment_items,

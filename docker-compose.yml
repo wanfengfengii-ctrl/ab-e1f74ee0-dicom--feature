@@ -7,8 +7,9 @@
 #   docker compose up --build api
 #
 # One-shot verification (waits for the API to become healthy, then runs unit
-# tests, an application build check and valid/bad-BOT API smoke tests; the
-# exit code is the verify service's exit code):
+# tests, an application build check and valid (Basic/Extended Offset Table)
+# and bad-offset-table API smoke tests; the exit code is the verify service's
+# exit code):
 #   docker compose up --build --abort-on-container-exit --exit-code-from verify
 
 services:

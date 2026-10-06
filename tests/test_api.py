@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import struct
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -14,6 +15,7 @@ from app.errors import (
     FILE_TOO_LARGE,
     FRAME_INDEX_OUT_OF_RANGE,
     INVALID_BASIC_OFFSET_TABLE,
+    INVALID_EXTENDED_OFFSET_TABLE,
     INVALID_FRAME_INDEX,
     INVALID_PREAMBLE,
     NO_FRAME_INDICES,
@@ -265,6 +267,43 @@ async def test_one_bad_frame_fails_whole_request():
     resp = await _post(body)
     assert resp.status_code == 422
     assert "frames" not in resp.json()
+
+
+# --------------------------------------------------------------------------- #
+# Extended Offset Table files (empty BOT + (7FE0,0001)/(7FE0,0002))
+# --------------------------------------------------------------------------- #
+
+async def test_extended_offset_file_returns_verbatim_frames_in_order():
+    frames = _frames(3, multi=(1,))
+    blob = build_dicom(frames, extended=True)
+    body = encode_multipart([("frames", "2,0,1")], [("file", "wsi.dcm", blob)])
+    resp = await _post(body)
+    assert resp.status_code == 200, resp.text
+    payload = resp.json()
+    assert payload["number_of_frames"] == 3
+    assert [f["index"] for f in payload["frames"]] == [2, 0, 1]
+    expected = {0: (frames[0], 1), 1: (b"".join(frames[1]), 3), 2: (frames[2], 1)}
+    by_index = {f["index"]: f for f in payload["frames"]}
+    for index, (raw, frag_count) in expected.items():
+        frame = by_index[index]
+        assert base64.b64decode(frame["data"]) == raw
+        assert frame["fragment_count"] == frag_count
+        assert frame["byte_count"] == len(raw)
+        assert frame["sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+async def test_extended_length_mismatch_rejected_without_partial_frames():
+    # Two frames; declare the first length one byte too small.
+    blob = build_dicom(
+        _frames(2),
+        extended=True,
+        ext_lengths_raw=struct.pack("<2Q", 1, 1),
+    )
+    body = encode_multipart([("frames", "0,1")], [("file", "bad.dcm", blob)])
+    resp = await _post(body)
+    assert resp.status_code == 422
+    assert resp.json()["error"]["type"] == INVALID_EXTENDED_OFFSET_TABLE
+    assert set(resp.json()) == {"error"}
 
 
 # --------------------------------------------------------------------------- #
